@@ -99,14 +99,12 @@ impl ThreadPool {
             self.config.max_thread_size & COUNT_MASK
         };
 
-        'retry: loop {
-            loop {
-                if worker_count_of(c) >= thread_size {
-                    return false;
-                }
-                if self.increment_worker_count(c) {
-                    break 'retry;
-                }
+        loop {
+            if worker_count_of(c) >= thread_size {
+                return false;
+            }
+            if self.increment_worker_count(c) {
+                break;
             }
         }
 
@@ -117,14 +115,15 @@ impl ThreadPool {
                 Arc::clone(&self.global_queue),
                 self.config.keep_alive_time,
                 self.config.allow_core_thread_time_out,
+                None,
             )
         } else {
-            Worker::new_with_task(
-                job.unwrap(),
+            Worker::new(
                 id,
                 Arc::clone(&self.global_queue),
                 self.config.keep_alive_time,
                 self.config.allow_core_thread_time_out,
+                job,
             )
         };
 

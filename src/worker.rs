@@ -25,41 +25,26 @@ impl Worker {
         task_queue: Arc<BlockQueue<Job>>,
         keep_alive_time: Duration,
         allow_core_thread_time_out: bool,
+        job: Option<Job>,
     ) -> Self {
         let running = Arc::new(AtomicBool::new(true));
         let running_state = Arc::clone(&running);
 
-        let thread = thread::spawn(move || {
-            let allow_core_thread_time_out = allow_core_thread_time_out;
-            while running_state.load(Ordering::SeqCst) {}
-        });
-
-        Worker {
-            id,
-            thread,
-            running,
-            task_queue,
-            keep_alive_time,
-        }
-    }
-
-    pub fn new_with_task(
-        job: Job,
-        id: u64,
-        task_queue: Arc<BlockQueue<Job>>,
-        keep_alive_time: Duration,
-        allow_core_thread_time_out: bool,
-    ) -> Self {
-        let first_job = Box::new(job);
-        let running = Arc::new(AtomicBool::new(true));
-        let running_state = Arc::clone(&running);
-        let thread = thread::spawn(move || {
-            let allow_core_thread_time_out = allow_core_thread_time_out;
-            if running_state.load(Ordering::SeqCst) {
-                first_job()
-            }
-            while running_state.load(Ordering::SeqCst) {}
-        });
+        let thread = if job.is_none() {
+            thread::spawn(move || {
+                let allow_core_thread_time_out = allow_core_thread_time_out;
+                while running_state.load(Ordering::SeqCst) {}
+            })
+        } else {
+            let first_job = job.unwrap();
+            thread::spawn(move || {
+                let allow_core_thread_time_out = allow_core_thread_time_out;
+                if running_state.load(Ordering::SeqCst) {
+                    first_job()
+                }
+                while running_state.load(Ordering::SeqCst) {}
+            })
+        };
 
         Worker {
             id,
