@@ -1,146 +1,206 @@
 mod error;
 mod queue;
-mod worker;
 
-pub use queue::BlockQueue;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use worker::{Job, Worker};
+pub use queue::JobQueue;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
 
-const COUNT_BITS: u32 = u32::BITS - 3;
-const COUNT_MASK: u32 = (1 << COUNT_BITS) - 1;
-const RUNING: u32 = 1 << COUNT_BITS;
+pub type Job = Box<dyn FnOnce() + Send + 'static>;
 
-fn worker_count_of(c: u32) -> u32 {
-    c & COUNT_MASK
+struct SharedData {
+    max_threads_size: AtomicU32,
+    alive_count: AtomicU32,
+    active_count: AtomicU32,
+    is_running: AtomicBool,
+    global_queue: JobQueue<Job>,
+    threads_idle: Condvar,
+    idle_lock: Mutex<()>,
 }
 
-fn ctl_of(rs: u32, wc: u32) -> u32 {
-    rs | wc
-}
+impl SharedData {
+    fn has_work(&self) -> bool {
+        self.active_count.load(Ordering::SeqCst) > 0 || !self.global_queue.is_empty()
+    }
 
-struct Config {
-    max_thread_size: u32,
-    core_thread_size: u32,
-    keep_alive_time: Duration,
-    allow_core_thread_time_out: bool,
+    fn increment_alive_count(&self) {
+        self.alive_count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn decrement_alive_count(&self) {
+        self.alive_count.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    fn increment_active_count(&self) {
+        self.active_count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn decrement_active_count(&self) {
+        self.active_count.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    fn is_running(&self) -> bool {
+        self.is_running.load(Ordering::SeqCst)
+    }
 }
 
 pub struct ThreadPool {
-    global_queue: Arc<BlockQueue<Job>>,
-    config: Config,
     workers: Mutex<Vec<Worker>>,
-    ctl: AtomicU32,
+    shared_data: Arc<SharedData>,
     global_id: AtomicU64,
 }
 
 impl ThreadPool {
-    pub fn new(
-        core_thread_size: u32,
-        max_thread_size: u32,
-        max_task_queue_size: u32,
-        keep_alive_time: u64,
-        allow_core_thread_time_out: bool,
-    ) -> Self {
-        let core_thread_size = if core_thread_size > max_thread_size {
-            max_thread_size
-        } else {
-            core_thread_size
-        };
+    pub fn new(max_threads_size: u32, task_queue_size: u32) -> Self {
+        let mut max_threads_size = max_threads_size;
+        if max_threads_size == 0 {
+            max_threads_size = 1;
+        }
 
-        let config = Config {
-            max_thread_size,
-            core_thread_size,
-            keep_alive_time: Duration::from_millis(keep_alive_time),
-            allow_core_thread_time_out,
-        };
+        let shared_data = Arc::new(SharedData {
+            max_threads_size: AtomicU32::new(max_threads_size),
+            alive_count: AtomicU32::new(0),
+            active_count: AtomicU32::new(0),
+            is_running: AtomicBool::new(true),
+            global_queue: JobQueue::new(task_queue_size),
+            threads_idle: Condvar::new(),
+            idle_lock: Mutex::new(()),
+        });
 
-        let workers = Mutex::new(Vec::with_capacity(core_thread_size as usize));
-        let global_queue = Arc::new(BlockQueue::new(max_task_queue_size, keep_alive_time));
+        let mut workers = Vec::with_capacity(max_threads_size as usize);
+        for i in 0..max_threads_size {
+            let worker = Worker::new(i as u64, Arc::clone(&shared_data));
+            workers.push(worker);
+        }
 
         ThreadPool {
-            global_queue,
-            config,
-            workers,
-            ctl: AtomicU32::new(ctl_of(RUNING, 0)),
-            global_id: AtomicU64::new(0),
+            workers: Mutex::new(workers),
+            shared_data,
+            global_id: AtomicU64::new(max_threads_size as u64),
         }
     }
 
-    pub fn execute<T>(&self, job: T)
+    pub fn execute<F>(&self, job: F)
     where
-        T: FnOnce() + Send + 'static,
+        F: FnOnce() + Send + 'static,
     {
-        let core_thread_size = self.config.core_thread_size;
+        if self.shared_data.is_running() {
+            return;
+        }
+        self.shared_data.global_queue.push_back(Box::new(job));
+    }
 
-        let mut c = self.ctl.load(Ordering::SeqCst);
-        if worker_count_of(c) < core_thread_size {
-            if self.add_worker(true, None) {
-                self.global_queue.push_back(Box::new(job));
-                return;
-            }
-            c = self.ctl.load(Ordering::SeqCst);
+    pub fn set_workers_num(&self, num: u32) {
+        if num == 0 {
+            return;
         }
 
-        let job = Box::new(job);
-        if let Some(job) = self.global_queue.push_back(job) {
-            if self.add_worker(false, Some(job)) {
-                // push失败，执行拒绝策略
-            }
+        let prev_num = self
+            .shared_data
+            .max_threads_size
+            .swap(num, Ordering::SeqCst);
+        if prev_num >= num {
+            return;
+        }
+
+        let sub = num - prev_num;
+
+        let mut workers = self.workers.lock().unwrap();
+        for _ in 0..sub {
+            let id = self.global_id.load(Ordering::SeqCst);
+            let worker = Worker::new(id, Arc::clone(&self.shared_data));
+            workers.push(worker);
         }
     }
 
-    fn add_worker(&self, core: bool, job: Option<Job>) -> bool {
-        let c = self.ctl.load(Ordering::SeqCst);
-        let thread_size = if core {
-            self.config.core_thread_size & COUNT_MASK
-        } else {
-            self.config.max_thread_size & COUNT_MASK
-        };
+    pub fn join(&self) {
+        let mut lock = self.shared_data.idle_lock.lock().unwrap();
+        while self.shared_data.has_work() {
+            lock = self.shared_data.threads_idle.wait(lock).unwrap();
+        }
+    }
 
-        loop {
-            if worker_count_of(c) >= thread_size {
-                return false;
-            }
-            if self.increment_worker_count(c) {
-                break;
-            }
+    pub fn terminate(&self) {
+        self.shared_data.is_running.store(false, Ordering::SeqCst);
+        while self.shared_data.alive_count.load(Ordering::SeqCst) > 0 {
+            self.shared_data.global_queue.notify_all();
+        }
+    }
+
+    pub fn alive_count(&self) -> u32 {
+        self.shared_data.alive_count.load(Ordering::SeqCst)
+    }
+
+    pub fn job_count(&self) -> u64 {
+        self.shared_data.global_queue.len()
+    }
+
+    pub fn completed_tasks(&self) -> u64 {
+        let mut res = 0u64;
+        let workers = self.workers.lock().unwrap();
+        for worker in &(*workers) {
+            res += worker.completed_tasks();
         }
 
-        let id = self.global_id.fetch_add(1, Ordering::SeqCst);
-        let worker = if core {
-            Worker::new(
-                id,
-                Arc::clone(&self.global_queue),
-                self.config.keep_alive_time,
-                self.config.allow_core_thread_time_out,
-                None,
-            )
-        } else {
-            Worker::new(
-                id,
-                Arc::clone(&self.global_queue),
-                self.config.keep_alive_time,
-                self.config.allow_core_thread_time_out,
-                job,
-            )
-        };
+        res
+    }
+}
 
-        self.workers.lock().unwrap().push(worker);
+struct Worker {
+    id: u64,
+    thread: JoinHandle<()>,
+    completed_tasks: Arc<AtomicU64>,
+}
 
-        true
+impl Worker {
+    fn new(id: u64, shared_data: Arc<SharedData>) -> Self {
+        let completed_tasks = Arc::new(AtomicU64::new(0));
+        let tasks_count = Arc::clone(&completed_tasks);
+        let thread = thread::spawn(move || {
+            shared_data.increment_alive_count();
+
+            while shared_data.is_running() {
+                let wc = shared_data.alive_count.load(Ordering::SeqCst);
+                let max_worker_count = shared_data.max_threads_size.load(Ordering::SeqCst);
+                if wc > max_worker_count {
+                    break;
+                }
+
+                shared_data.global_queue.wait();
+                if !shared_data.is_running() {
+                    break;
+                }
+
+                shared_data.increment_active_count();
+
+                let job = shared_data.global_queue.pop_front();
+                if let Some(job) = job {
+                    job();
+                    tasks_count.fetch_add(1, Ordering::SeqCst);
+                }
+
+                shared_data.decrement_active_count();
+                if !shared_data.has_work() {
+                    *shared_data.idle_lock.lock().unwrap();
+                    shared_data.threads_idle.notify_all();
+                }
+            }
+
+            shared_data.decrement_alive_count();
+        });
+
+        Worker {
+            id,
+            thread,
+            completed_tasks,
+        }
     }
 
-    fn increment_worker_count(&self, expect: u32) -> bool {
-        self.ctl
-            .compare_exchange(expect, expect + 1, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
+    fn completed_tasks(&self) -> u64 {
+        self.completed_tasks.load(Ordering::SeqCst)
     }
 
-    fn decrement_worker_count(&self, expect: u32) -> bool {
-        self.ctl
-            .compare_exchange(expect, expect - 1, Ordering::SeqCst, Ordering::SeqCst)
-            .is_ok()
+    fn id(&self) -> u64 {
+        self.id
     }
 }
