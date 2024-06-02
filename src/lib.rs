@@ -1,4 +1,3 @@
-mod error;
 mod queue;
 
 pub use queue::JobQueue;
@@ -106,11 +105,13 @@ impl ThreadPool {
         let sub = num - prev_num;
 
         let mut workers = self.workers.lock().unwrap();
+        let mut id = self.global_id.load(Ordering::Relaxed);
         for _ in 0..sub {
-            let id = self.global_id.load(Ordering::SeqCst);
             let worker = Worker::new(id, Arc::clone(&self.shared_data));
             workers.push(worker);
+            id += 1;
         }
+        self.global_id.store(id, Ordering::Relaxed);
     }
 
     pub fn join(&self) {
